@@ -12,7 +12,7 @@ use zip::ZipArchive;
 #[command(
     name = "app-rename",
     version,
-    about = "Rename APK/XAPK files to package_version.ext"
+    about = "Rename APK/XAPK files to package_version.ext (detects by content, not extension)"
 )]
 struct Cli {
     /// APK/XAPK file or directory path(s)
@@ -49,7 +49,7 @@ enum AppKind {
 }
 
 impl AppKind {
-    fn from_path(path: &Path) -> Option<Self> {
+    fn from_extension(path: &Path) -> Option<Self> {
         match path
             .extension()?
             .to_string_lossy()
@@ -60,6 +60,35 @@ impl AppKind {
             "xapk" => Some(Self::Xapk),
             _ => None,
         }
+    }
+
+    /// Detect kind by probing file content (zip structure).
+    /// Returns None if the file is not a valid APK/XAPK.
+    fn detect(path: &Path) -> Option<Self> {
+        // Fast path: recognized extension
+        if let Some(kind) = Self::from_extension(path) {
+            return Some(kind);
+        }
+        // Content-based detection: try opening as zip
+        let file = File::open(path).ok()?;
+        let mut zip = ZipArchive::new(file).ok()?;
+        // XAPK: contains manifest.json at top level
+        if zip.by_name("manifest.json").is_ok() {
+            return Some(Self::Xapk);
+        }
+        // APK: contains AndroidManifest.xml
+        if zip.by_name("AndroidManifest.xml").is_ok() {
+            return Some(Self::Apk);
+        }
+        // Check if it contains embedded .apk files (split XAPK without manifest.json)
+        for i in 0..zip.len() {
+            if let Ok(entry) = zip.by_index(i) {
+                if entry.name().to_ascii_lowercase().ends_with(".apk") {
+                    return Some(Self::Xapk);
+                }
+            }
+        }
+        None
     }
 
     fn ext(self) -> &'static str {
@@ -115,16 +144,15 @@ fn collect_inputs(cli: &Cli) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for path in &cli.paths {
         if path.is_file() {
-            if AppKind::from_path(path).is_some() {
-                files.push(path.clone());
-            }
+            // Accept any file; detection happens at process time
+            files.push(path.clone());
             continue;
         }
         if path.is_dir() {
             if cli.recursive {
                 for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
                     let p = entry.path();
-                    if p.is_file() && AppKind::from_path(p).is_some() {
+                    if p.is_file() {
                         files.push(p.to_path_buf());
                     }
                 }
@@ -133,7 +161,7 @@ fn collect_inputs(cli: &Cli) -> Result<Vec<PathBuf>> {
                     fs::read_dir(path).with_context(|| format!("read dir {}", path.display()))?
                 {
                     let p = entry?.path();
-                    if p.is_file() && AppKind::from_path(&p).is_some() {
+                    if p.is_file() {
                         files.push(p);
                     }
                 }
@@ -159,7 +187,15 @@ enum ProcessOutcome {
 }
 
 fn process_one(path: &Path, cli: &Cli) -> Result<ProcessOutcome> {
-    let kind = AppKind::from_path(path).ok_or_else(|| anyhow!("unsupported extension"))?;
+    let kind = match AppKind::detect(path) {
+        Some(k) => k,
+        None => {
+            return Ok(ProcessOutcome::Skipped {
+                path: path.to_path_buf(),
+                reason: "not a valid APK/XAPK".to_string(),
+            });
+        }
+    };
     let meta = match kind {
         AppKind::Apk => read_apk_meta(path),
         AppKind::Xapk => read_xapk_meta(path),
